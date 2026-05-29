@@ -11,9 +11,10 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from twikit import Client
+from twikit.x_client_transaction import ClientTransaction
 
 
-# ローカル開発では .env を読み込み、Render では環境変数をそのまま使います。
+# Local development reads .env. Render uses environment variables directly.
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -23,7 +24,7 @@ DATA_DIR.mkdir(exist_ok=True)
 
 @dataclass(frozen=True)
 class Settings:
-    """初心者でも編集しやすいよう、設定値をここに集約しています。"""
+    """Editable app settings collected in one place."""
 
     app_name: str = os.getenv("APP_NAME", "sonsial x view")
     twikit_username: str = os.getenv("TWIKIT_USERNAME", "")
@@ -31,11 +32,17 @@ class Settings:
     twikit_password: str = os.getenv("TWIKIT_PASSWORD", "")
     twikit_totp_secret: str = os.getenv("TWIKIT_TOTP_SECRET", "")
     twikit_language: str = os.getenv("TWIKIT_LANGUAGE", "ja-JP")
+    twikit_user_agent: str = os.getenv(
+        "TWIKIT_USER_AGENT",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    )
     cookie_file: Path = Path(os.getenv("TWIKIT_COOKIE_FILE", DATA_DIR / "cookies.json"))
     cache_ttl_seconds: int = int(os.getenv("CACHE_TTL_SECONDS", "120"))
     request_min_interval_seconds: float = float(os.getenv("REQUEST_MIN_INTERVAL_SECONDS", "2.0"))
     retry_attempts: int = int(os.getenv("RETRY_ATTEMPTS", "3"))
     retry_backoff_seconds: float = float(os.getenv("RETRY_BACKOFF_SECONDS", "1.5"))
+    request_timeout_seconds: float = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
     tweet_count: int = min(int(os.getenv("TWEET_COUNT", "20")), 20)
     default_timeline: str = os.getenv("DEFAULT_TIMELINE", "latest")
 
@@ -45,7 +52,7 @@ class Settings:
 
 
 class TTLCache:
-    """Twikitへのアクセス回数を減らすための軽量インメモリキャッシュです。"""
+    """Small in-memory cache to reduce requests to X/Twitter."""
 
     def __init__(self, ttl_seconds: int) -> None:
         self.ttl_seconds = ttl_seconds
@@ -65,18 +72,50 @@ class TTLCache:
     def set(self, key: str, value: Any) -> None:
         self._items[key] = (time.time() + self.ttl_seconds, value)
 
+    def clear(self) -> None:
+        self._items.clear()
+
 
 class TwikitService:
-    """ログイン、Cookie保存、リトライ、rate limit対策をまとめたサービス層です。"""
+    """Twikit login, cookie persistence, retry, and rate-limit protection."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.client = Client(settings.twikit_language)
+        self.client = self._create_client()
         self.cache = TTLCache(settings.cache_ttl_seconds)
         self._login_lock = asyncio.Lock()
         self._request_lock = asyncio.Lock()
         self._last_request_at = 0.0
         self._logged_in = False
+
+    def _create_client(self) -> Client:
+        return Client(
+            language=self.settings.twikit_language,
+            user_agent=self.settings.twikit_user_agent,
+            timeout=self.settings.request_timeout_seconds,
+            follow_redirects=True,
+        )
+
+    def _reset_client_transaction(self) -> None:
+        """Reset Twikit's X-Client-Transaction state after partial initialization."""
+
+        self.client.client_transaction = ClientTransaction()
+
+    def _is_transaction_state_error(self, error: Exception) -> bool:
+        message = str(error).lower()
+        return (
+            isinstance(error, AttributeError)
+            and "clienttransaction" in message
+            and "key" in message
+        ) or any(
+            text in message
+            for text in [
+                "couldn't get key",
+                "couldn't get key_byte indices",
+                "invalid response",
+                "x-client-transaction",
+            ]
+        )
 
     async def ensure_login(self, force: bool = False) -> None:
         if self._logged_in and not force:
@@ -88,26 +127,29 @@ class TwikitService:
 
             if not self.settings.can_login:
                 raise RuntimeError(
-                    "TWIKIT_USERNAME と TWIKIT_PASSWORD を .env または Render 環境変数に設定してください。"
+                    "Set TWIKIT_USERNAME and TWIKIT_PASSWORD in .env or Render environment variables."
                 )
 
             self.settings.cookie_file.parent.mkdir(parents=True, exist_ok=True)
 
-            # 次回起動時は保存済みCookieから自動ログインを試します。
+            if force:
+                self._logged_in = False
+                self._reset_client_transaction()
+                self.settings.cookie_file.unlink(missing_ok=True)
+
+            # Prefer saved cookies on the next boot. If they are invalid, fall back to login.
             if self.settings.cookie_file.exists() and not force:
                 try:
+                    self._reset_client_transaction()
                     self.client.load_cookies(str(self.settings.cookie_file))
                     await self.client.user_id()
                     self._logged_in = True
                     return
                 except Exception:
                     self._logged_in = False
+                    self._reset_client_transaction()
                     self.settings.cookie_file.unlink(missing_ok=True)
 
-            if force:
-                self.settings.cookie_file.unlink(missing_ok=True)
-
-            # Cookieが無い/期限切れ/検証失敗の場合は再ログインし、成功後にCookieを保存します。
             await self.client.login(
                 auth_info_1=self.settings.twikit_username,
                 auth_info_2=self.settings.twikit_email or None,
@@ -119,7 +161,7 @@ class TwikitService:
             self._logged_in = True
 
     async def _wait_for_rate_limit(self) -> None:
-        """短時間に連続リクエストしないよう、全Twikit呼び出しをゆるく直列化します。"""
+        """Serialize Twikit calls and keep a configurable minimum interval."""
 
         async with self._request_lock:
             elapsed = time.monotonic() - self._last_request_at
@@ -140,8 +182,10 @@ class TwikitService:
                 last_error = error
                 message = str(error).lower()
 
-                # Cookie期限切れ・CSRF系の失敗は再ログインしてから再試行します。
-                if any(word in message for word in ["unauthorized", "forbidden", "csrf", "login"]):
+                if self._is_transaction_state_error(error):
+                    self._reset_client_transaction()
+                    self.cache.clear()
+                elif any(word in message for word in ["unauthorized", "forbidden", "csrf", "login"]):
                     await self.ensure_login(force=True)
 
                 if attempt < self.settings.retry_attempts:
@@ -225,7 +269,6 @@ def normalize_media(media_items: list[Any] | None) -> list[dict[str, str]]:
         media_type = safe_attr(media, "type", "photo")
         media_url = safe_attr(media, "media_url", "") or safe_attr(media, "url", "")
 
-        # 動画/GIFはプレビューURLを優先し、無ければ最初のストリームURLを使います。
         streams = safe_attr(media, "streams", []) or []
         if not media_url and streams:
             media_url = safe_attr(streams[0], "url", "")
@@ -240,6 +283,7 @@ def normalize_tweet(tweet: Any) -> dict[str, Any]:
     retweeted_tweet = safe_attr(tweet, "retweeted_tweet", None)
     display_tweet = retweeted_tweet or tweet
     display_user = safe_attr(display_tweet, "user", user)
+    quote = safe_attr(display_tweet, "quote", None)
 
     return {
         "id": safe_attr(display_tweet, "id", ""),
@@ -252,7 +296,7 @@ def normalize_tweet(tweet: Any) -> dict[str, Any]:
         "favorite_count": safe_attr(display_tweet, "favorite_count", 0),
         "view_count": safe_attr(display_tweet, "view_count", None),
         "is_retweet": retweeted_tweet is not None,
-        "quote": normalize_tweet(safe_attr(display_tweet, "quote", None)) if safe_attr(display_tweet, "quote", None) else None,
+        "quote": normalize_tweet(quote) if quote else None,
     }
 
 
@@ -320,3 +364,8 @@ async def api_user(screen_name: str) -> dict[str, Any]:
     if not screen_name:
         raise HTTPException(status_code=404, detail="User not found")
     return await service.user_profile(screen_name)
+
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
