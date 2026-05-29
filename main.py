@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from twikit import Client
+from twikit.client import client as twikit_client_module
 from twikit.x_client_transaction import ClientTransaction
 
 
@@ -43,12 +44,161 @@ class Settings:
     retry_attempts: int = int(os.getenv("RETRY_ATTEMPTS", "3"))
     retry_backoff_seconds: float = float(os.getenv("RETRY_BACKOFF_SECONDS", "1.5"))
     request_timeout_seconds: float = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
+    transaction_mode: str = os.getenv("TWIKIT_TRANSACTION_MODE", "auto").lower()
+    refresh_transaction_before_timeline: bool = (
+        os.getenv("REFRESH_TRANSACTION_BEFORE_TIMELINE", "true").lower() == "true"
+    )
     tweet_count: int = min(int(os.getenv("TWEET_COUNT", "20")), 20)
     default_timeline: str = os.getenv("DEFAULT_TIMELINE", "latest")
 
     @property
     def can_login(self) -> bool:
         return bool(self.twikit_username and self.twikit_password)
+
+
+class StableTwikitClient(Client):
+    """Twikit Client with a safe fallback when X transaction JS parsing breaks."""
+
+    def __init__(self, *args: Any, transaction_mode: str = "auto", **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.transaction_mode = transaction_mode if transaction_mode in {"auto", "strict", "disabled"} else "auto"
+        self.transaction_disabled = self.transaction_mode == "disabled"
+        self.last_transaction_error = ""
+
+    def reset_transaction(self) -> None:
+        self.client_transaction = ClientTransaction()
+        self.transaction_disabled = self.transaction_mode == "disabled"
+        self.last_transaction_error = ""
+
+    def disable_transaction(self, error: Exception | str) -> None:
+        self.client_transaction = ClientTransaction()
+        self.transaction_disabled = True
+        self.last_transaction_error = str(error)
+
+    def is_transaction_error(self, error: Exception) -> bool:
+        message = str(error).lower()
+        return (
+            "clienttransaction" in message
+            or "x-client-transaction" in message
+            or "key_byte" in message
+            or "couldn't get key" in message
+            or "invalid response" in message
+        )
+
+    async def refresh_transaction(self) -> bool:
+        if self.transaction_mode == "disabled":
+            self.transaction_disabled = True
+            return False
+
+        cookies_backup = self.get_cookies().copy()
+        ct_headers = {
+            "Accept-Language": f"{self.language},{self.language.split('-')[0]};q=0.9",
+            "Cache-Control": "no-cache",
+            "Referer": f"https://{twikit_client_module.DOMAIN}",
+            "User-Agent": self._user_agent,
+        }
+
+        try:
+            self.client_transaction = ClientTransaction()
+            await self.client_transaction.init(self.http, ct_headers)
+            self.set_cookies(cookies_backup, clear_cookies=True)
+            self.transaction_disabled = False
+            self.last_transaction_error = ""
+            return True
+        except Exception as error:
+            self.set_cookies(cookies_backup, clear_cookies=True)
+            if self.transaction_mode == "strict":
+                raise
+            self.disable_transaction(error)
+            return False
+
+    async def _add_transaction_header(self, method: str, url: str, headers: dict[str, Any]) -> dict[str, Any]:
+        if self.transaction_disabled or self.transaction_mode == "disabled":
+            return headers
+
+        try:
+            if not self.client_transaction.home_page_response:
+                await self.refresh_transaction()
+
+            if not self.transaction_disabled:
+                transaction_id = self.client_transaction.generate_transaction_id(
+                    method=method,
+                    path=twikit_client_module.urlparse(url).path,
+                )
+                headers["X-Client-Transaction-Id"] = transaction_id
+        except Exception as error:
+            if self.transaction_mode == "strict" or not self.is_transaction_error(error):
+                raise
+            self.disable_transaction(error)
+            headers.pop("X-Client-Transaction-Id", None)
+
+        return headers
+
+    async def request(
+        self,
+        method: str,
+        url: str,
+        auto_unlock: bool = True,
+        raise_exception: bool = True,
+        **kwargs: Any,
+    ) -> tuple[dict | Any, Any]:
+        headers = kwargs.pop("headers", {})
+        headers = await self._add_transaction_header(method, url, headers)
+
+        cookies_backup = self.get_cookies().copy()
+        response = await self.http.request(method, url, headers=headers, **kwargs)
+        self._remove_duplicate_ct0_cookie()
+
+        try:
+            response_data = response.json()
+        except twikit_client_module.json.decoder.JSONDecodeError:
+            response_data = response.text
+
+        if isinstance(response_data, dict) and "errors" in response_data:
+            error_code = response_data["errors"][0]["code"]
+            error_message = response_data["errors"][0].get("message")
+            if error_code in (37, 64):
+                raise twikit_client_module.AccountSuspended(error_message)
+
+            if error_code == 326:
+                if self.captcha_solver is None:
+                    raise twikit_client_module.AccountLocked(
+                        "Your account is locked. Visit "
+                        f"https://{twikit_client_module.DOMAIN}/account/access to unlock it."
+                    )
+                if auto_unlock:
+                    await self.unlock()
+                    self.set_cookies(cookies_backup, clear_cookies=True)
+                    response = await self.http.request(method, url, **kwargs)
+                    self._remove_duplicate_ct0_cookie()
+                    try:
+                        response_data = response.json()
+                    except twikit_client_module.json.decoder.JSONDecodeError:
+                        response_data = response.text
+
+        status_code = response.status_code
+
+        if status_code >= 400 and raise_exception:
+            message = f'status: {status_code}, message: "{response.text}"'
+            if status_code == 400:
+                raise twikit_client_module.BadRequest(message, headers=response.headers)
+            if status_code == 401:
+                raise twikit_client_module.Unauthorized(message, headers=response.headers)
+            if status_code == 403:
+                raise twikit_client_module.Forbidden(message, headers=response.headers)
+            if status_code == 404:
+                raise twikit_client_module.NotFound(message, headers=response.headers)
+            if status_code == 408:
+                raise twikit_client_module.RequestTimeout(message, headers=response.headers)
+            if status_code == 429:
+                if await self._get_user_state() == "suspended":
+                    raise twikit_client_module.AccountSuspended(message, headers=response.headers)
+                raise twikit_client_module.TooManyRequests(message, headers=response.headers)
+            if 500 <= status_code < 600:
+                raise twikit_client_module.ServerError(message, headers=response.headers)
+            raise twikit_client_module.TwitterException(message, headers=response.headers)
+
+        return response_data, response
 
 
 class TTLCache:
@@ -89,9 +239,10 @@ class TwikitService:
         self._logged_in = False
 
     def _create_client(self) -> Client:
-        return Client(
+        return StableTwikitClient(
             language=self.settings.twikit_language,
             user_agent=self.settings.twikit_user_agent,
+            transaction_mode=self.settings.transaction_mode,
             timeout=self.settings.request_timeout_seconds,
             follow_redirects=True,
         )
@@ -99,7 +250,10 @@ class TwikitService:
     def _reset_client_transaction(self) -> None:
         """Reset Twikit's X-Client-Transaction state after partial initialization."""
 
-        self.client.client_transaction = ClientTransaction()
+        if isinstance(self.client, StableTwikitClient):
+            self.client.reset_transaction()
+        else:
+            self.client.client_transaction = ClientTransaction()
 
     def _is_transaction_state_error(self, error: Exception) -> bool:
         message = str(error).lower()
@@ -185,6 +339,8 @@ class TwikitService:
                 if self._is_transaction_state_error(error):
                     self._reset_client_transaction()
                     self.cache.clear()
+                    if isinstance(self.client, StableTwikitClient) and self.settings.transaction_mode == "auto":
+                        self.client.disable_transaction(error)
                 elif any(word in message for word in ["unauthorized", "forbidden", "csrf", "login"]):
                     await self.ensure_login(force=True)
 
@@ -200,6 +356,8 @@ class TwikitService:
             return cached
 
         async def fetch() -> Any:
+            if self.settings.refresh_transaction_before_timeline and isinstance(self.client, StableTwikitClient):
+                await self.client.refresh_transaction()
             if mode == "for_you":
                 return await self.client.get_timeline(count=self.settings.tweet_count)
             return await self.client.get_latest_timeline(count=self.settings.tweet_count)
