@@ -10,11 +10,29 @@ services:
         value: sonsial x view
       - key: TWIKIT_LANGUAGE
         value: ja-JP
+      - key: TWIKIT_TRANSACTION_MODE
+        value: auto
+      - key: REFRESH_TRANSACTION_BEFORE_TIMELINE
+        value: true
+      - key: BROWSER_ACCEPT_LANGUAGE
+        value: ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7
+      - key: BROWSER_REFERER
+        value: https://x.com/home
       - key: CACHE_TTL_SECONDS
         value: 120
       - key: REQUEST_MIN_INTERVAL_SECONDS
         value: 2.0
+      - key: REQUEST_JITTER_SECONDS
+        value: 1.5
       - key: RETRY_ATTEMPTS
         value: 3
+      - key: RETRY_BACKOFF_SECONDS
+        value: 1.5
+      - key: RETRY_BACKOFF_JITTER_SECONDS
+        value: 1.0
+      - key: TIMELINE_SLEEP_MIN_SECONDS
+        value: 0.8
+      - key: TIMELINE_SLEEP_MAX_SECONDS
+        value: 2.4
       - key: TWEET_COUNT
         value: 20

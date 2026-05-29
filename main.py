@@ -1,5 +1,6 @@
 import asyncio
 import os
+import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,14 +37,20 @@ class Settings:
     twikit_user_agent: str = os.getenv(
         "TWIKIT_USER_AGENT",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
     )
+    browser_accept_language: str = os.getenv("BROWSER_ACCEPT_LANGUAGE", "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7")
+    browser_referer: str = os.getenv("BROWSER_REFERER", "https://x.com/home")
     cookie_file: Path = Path(os.getenv("TWIKIT_COOKIE_FILE", DATA_DIR / "cookies.json"))
     cache_ttl_seconds: int = int(os.getenv("CACHE_TTL_SECONDS", "120"))
     request_min_interval_seconds: float = float(os.getenv("REQUEST_MIN_INTERVAL_SECONDS", "2.0"))
+    request_jitter_seconds: float = float(os.getenv("REQUEST_JITTER_SECONDS", "1.5"))
     retry_attempts: int = int(os.getenv("RETRY_ATTEMPTS", "3"))
     retry_backoff_seconds: float = float(os.getenv("RETRY_BACKOFF_SECONDS", "1.5"))
+    retry_backoff_jitter_seconds: float = float(os.getenv("RETRY_BACKOFF_JITTER_SECONDS", "1.0"))
     request_timeout_seconds: float = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
+    timeline_sleep_min_seconds: float = float(os.getenv("TIMELINE_SLEEP_MIN_SECONDS", "0.8"))
+    timeline_sleep_max_seconds: float = float(os.getenv("TIMELINE_SLEEP_MAX_SECONDS", "2.4"))
     transaction_mode: str = os.getenv("TWIKIT_TRANSACTION_MODE", "auto").lower()
     refresh_transaction_before_timeline: bool = (
         os.getenv("REFRESH_TRANSACTION_BEFORE_TIMELINE", "true").lower() == "true"
@@ -54,6 +61,25 @@ class Settings:
     @property
     def can_login(self) -> bool:
         return bool(self.twikit_username and self.twikit_password)
+
+
+def build_browser_headers(settings: Settings) -> dict[str, str]:
+    """Chrome-like default headers for httpx/Twikit requests."""
+
+    return {
+        "User-Agent": settings.twikit_user_agent,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": settings.browser_accept_language,
+        "Referer": settings.browser_referer,
+        "Sec-CH-UA": '"Chromium";v="148", "Google Chrome";v="148", "Not?A_Brand";v="99"',
+        "Sec-CH-UA-Mobile": "?0",
+        "Sec-CH-UA-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "DNT": "1",
+        "Upgrade-Insecure-Requests": "1",
+    }
 
 
 class StableTwikitClient(Client):
@@ -142,7 +168,7 @@ class StableTwikitClient(Client):
         raise_exception: bool = True,
         **kwargs: Any,
     ) -> tuple[dict | Any, Any]:
-        headers = kwargs.pop("headers", {})
+        headers = {**self.http.headers, **kwargs.pop("headers", {})}
         headers = await self._add_transaction_header(method, url, headers)
 
         cookies_backup = self.get_cookies().copy()
@@ -243,6 +269,7 @@ class TwikitService:
             language=self.settings.twikit_language,
             user_agent=self.settings.twikit_user_agent,
             transaction_mode=self.settings.transaction_mode,
+            headers=build_browser_headers(self.settings),
             timeout=self.settings.request_timeout_seconds,
             follow_redirects=True,
         )
@@ -270,6 +297,62 @@ class TwikitService:
                 "x-client-transaction",
             ]
         )
+
+    def _is_cloudflare_block(self, error: Exception) -> bool:
+        message = str(error).lower()
+        return (
+            "status: 403" in message
+            and any(
+                text in message
+                for text in [
+                    "cloudflare",
+                    "cf-ray",
+                    "attention required",
+                    "just a moment",
+                    "blocked",
+                    "bot",
+                ]
+            )
+        )
+
+    def _fallback_tweet(self, title: str, detail: str) -> dict[str, Any]:
+        return {
+            "id": "fallback-cloudflare",
+            "text": f"{title}\n\n{detail}",
+            "created_at": "fallback",
+            "user": {
+                "id": "system",
+                "name": self.settings.app_name,
+                "screen_name": "system",
+                "avatar": "",
+                "banner": "",
+                "description": "",
+                "followers_count": 0,
+                "following_count": 0,
+                "statuses_count": 0,
+                "verified": True,
+            },
+            "media": [],
+            "reply_count": 0,
+            "retweet_count": 0,
+            "favorite_count": 0,
+            "view_count": None,
+            "is_retweet": False,
+            "quote": None,
+        }
+
+    def _cloudflare_fallback_tweets(self) -> list[dict[str, Any]]:
+        return [
+            self._fallback_tweet(
+                "X.com / Cloudflare がRender共有IPからのアクセスを403でブロックしました。",
+                "アプリは停止していません。時間を置く、独自IP/別ホスティングを使う、またはRender環境変数でREQUEST_MIN_INTERVAL_SECONDSとCACHE_TTL_SECONDSを大きくしてください。",
+            )
+        ]
+
+    async def _sleep_before_timeline(self) -> None:
+        min_seconds = max(0.0, self.settings.timeline_sleep_min_seconds)
+        max_seconds = max(min_seconds, self.settings.timeline_sleep_max_seconds)
+        await asyncio.sleep(random.uniform(min_seconds, max_seconds))
 
     async def ensure_login(self, force: bool = False) -> None:
         if self._logged_in and not force:
@@ -319,7 +402,8 @@ class TwikitService:
 
         async with self._request_lock:
             elapsed = time.monotonic() - self._last_request_at
-            wait_seconds = self.settings.request_min_interval_seconds - elapsed
+            jitter = random.uniform(0, max(0.0, self.settings.request_jitter_seconds))
+            wait_seconds = self.settings.request_min_interval_seconds + jitter - elapsed
             if wait_seconds > 0:
                 await asyncio.sleep(wait_seconds)
             self._last_request_at = time.monotonic()
@@ -345,7 +429,11 @@ class TwikitService:
                     await self.ensure_login(force=True)
 
                 if attempt < self.settings.retry_attempts:
-                    await asyncio.sleep(self.settings.retry_backoff_seconds * attempt)
+                    backoff = self.settings.retry_backoff_seconds * attempt
+                    jitter = random.uniform(0, max(0.0, self.settings.retry_backoff_jitter_seconds))
+                    if self._is_cloudflare_block(error):
+                        backoff *= 2
+                    await asyncio.sleep(backoff + jitter)
 
         raise last_error or RuntimeError("Twikit request failed")
 
@@ -356,13 +444,20 @@ class TwikitService:
             return cached
 
         async def fetch() -> Any:
+            await self._sleep_before_timeline()
             if self.settings.refresh_transaction_before_timeline and isinstance(self.client, StableTwikitClient):
                 await self.client.refresh_transaction()
             if mode == "for_you":
                 return await self.client.get_timeline(count=self.settings.tweet_count)
             return await self.client.get_latest_timeline(count=self.settings.tweet_count)
 
-        tweets = [normalize_tweet(tweet) for tweet in await self._with_retry(fetch)]
+        try:
+            tweets = [normalize_tweet(tweet) for tweet in await self._with_retry(fetch)]
+        except Exception as error:
+            if self._is_cloudflare_block(error):
+                tweets = self._cloudflare_fallback_tweets()
+            else:
+                raise
         self.cache.set(cache_key, tweets)
         return tweets
 
@@ -376,7 +471,13 @@ class TwikitService:
         async def fetch() -> Any:
             return await self.client.search_tweet(query, product, count=self.settings.tweet_count)
 
-        tweets = [normalize_tweet(tweet) for tweet in await self._with_retry(fetch)]
+        try:
+            tweets = [normalize_tweet(tweet) for tweet in await self._with_retry(fetch)]
+        except Exception as error:
+            if self._is_cloudflare_block(error):
+                tweets = self._cloudflare_fallback_tweets()
+            else:
+                raise
         self.cache.set(cache_key, tweets)
         return tweets
 
@@ -393,7 +494,26 @@ class TwikitService:
             tweets = await self.client.get_user_tweets(user.id, "Tweets", count=self.settings.tweet_count)
             return user, tweets
 
-        user, tweets = await self._with_retry(fetch)
+        try:
+            user, tweets = await self._with_retry(fetch)
+        except Exception as error:
+            if self._is_cloudflare_block(error):
+                return {
+                    "user": {
+                        "id": "system",
+                        "name": self.settings.app_name,
+                        "screen_name": screen_name,
+                        "avatar": "",
+                        "banner": "",
+                        "description": "Cloudflare 403 fallback response",
+                        "followers_count": 0,
+                        "following_count": 0,
+                        "statuses_count": 0,
+                        "verified": True,
+                    },
+                    "tweets": self._cloudflare_fallback_tweets(),
+                }
+            raise
         result = {
             "user": normalize_user(user),
             "tweets": [normalize_tweet(tweet) for tweet in tweets],
