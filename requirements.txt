@@ -1,0 +1,7 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+jinja2==3.1.5
+python-dotenv==1.0.1
+twikit>=2.3.3
+httpx>=0.27.0
+js2py>=0.74

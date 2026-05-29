@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <header class="sticky top-0 z-30 border-b border-xborder bg-black/80 backdrop-blur">
+    <div class="px-4 py-3">
+      <h1 class="text-xl font-black">ホーム</h1>
+      <div class="mt-3 grid grid-cols-2 rounded-full bg-zinc-900 p-1 text-sm font-semibold">
+        <a class="timeline-tab {% if mode != 'for_you' %}active{% endif %}" href="/?mode=latest">最新</a>
+        <a class="timeline-tab {% if mode == 'for_you' %}active{% endif %}" href="/?mode=for_you">おすすめ</a>
+      </div>
+    </div>
+  </header>
+
+  <section>
+    {% for tweet in tweets %}
+      {% include "partials/tweet_card.html" %}
+    {% else %}
+      <div class="p-8 text-center text-zinc-500">ツイートが見つかりませんでした。</div>
+    {% endfor %}
+  </section>
+{% endblock %}

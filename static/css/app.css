@@ -1,0 +1,114 @@
+html {
+  color-scheme: dark;
+}
+
+body {
+  overflow-y: scroll;
+}
+
+.side-link {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  width: fit-content;
+  border-radius: 9999px;
+  padding: 0.75rem;
+  font-size: 1.25rem;
+  font-weight: 700;
+  transition: background-color 160ms ease, transform 160ms ease;
+}
+
+.side-link:hover {
+  background: rgba(39, 39, 42, 0.9);
+  transform: translateX(2px);
+}
+
+.tweet-card {
+  display: flex;
+  gap: 0.75rem;
+  border-bottom: 1px solid #2f3336;
+  padding: 1rem;
+  transition: background-color 160ms ease;
+}
+
+.tweet-card:hover {
+  background: rgba(24, 24, 27, 0.38);
+}
+
+.avatar {
+  height: 2.75rem;
+  width: 2.75rem;
+  border-radius: 9999px;
+  object-fit: cover;
+}
+
+.tweet-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.55;
+}
+
+.tweet-media {
+  width: 100%;
+  max-height: 30rem;
+  object-fit: cover;
+  background: #18181b;
+}
+
+.tweet-action {
+  border-radius: 9999px;
+  padding: 0.25rem 0.45rem;
+  transition: color 160ms ease, background-color 160ms ease;
+}
+
+.tweet-action:hover {
+  color: #1d9bf0;
+  background: rgba(29, 155, 240, 0.12);
+}
+
+.timeline-tab {
+  border-radius: 9999px;
+  padding: 0.625rem;
+  text-align: center;
+  color: #a1a1aa;
+  transition: background-color 160ms ease, color 160ms ease;
+}
+
+.timeline-tab:hover,
+.timeline-tab.active {
+  background: #1d9bf0;
+  color: white;
+}
+
+.mobile-nav-link {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.15rem;
+  min-width: 4rem;
+  border-radius: 9999px;
+  padding: 0.25rem 0.5rem;
+  color: #d4d4d8;
+  font-size: 1.25rem;
+  transition: background-color 160ms ease, color 160ms ease;
+}
+
+.mobile-nav-link span {
+  font-size: 0.68rem;
+}
+
+.mobile-nav-link:hover {
+  color: #1d9bf0;
+  background: rgba(29, 155, 240, 0.1);
+}
+
+@media (max-width: 640px) {
+  .tweet-card {
+    padding: 0.875rem;
+  }
+
+  .avatar {
+    height: 2.5rem;
+    width: 2.5rem;
+  }
+}

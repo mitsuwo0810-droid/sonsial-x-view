@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="ja" class="bg-black">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{% block title %}{{ settings.app_name }}{% endblock %}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              xblue: "#1d9bf0",
+              xborder: "#2f3336",
+              xmuted: "#71767b",
+            },
+          },
+        },
+      };
+    </script>
+    <link rel="stylesheet" href="{{ url_for('static', path='css/app.css') }}" />
+  </head>
+  <body class="min-h-screen bg-black text-zinc-100 antialiased">
+    <div class="mx-auto grid min-h-screen max-w-6xl grid-cols-1 md:grid-cols-[88px_minmax(0,640px)_1fr] lg:grid-cols-[260px_minmax(0,640px)_1fr]">
+      <aside class="sticky top-0 hidden h-screen border-r border-xborder px-3 py-4 md:block">
+        {% include "partials/sidebar.html" %}
+      </aside>
+
+      <main class="min-w-0 border-x border-xborder pb-20 md:pb-0">
+        {% block content %}{% endblock %}
+      </main>
+
+      <aside class="sticky top-0 hidden h-screen px-5 py-4 xl:block">
+        <div class="rounded-2xl bg-zinc-900/80 p-4">
+          <h2 class="text-lg font-bold">使い方</h2>
+          <p class="mt-2 text-sm leading-6 text-zinc-400">
+            検索、ユーザーページ、タイムラインをTwikit経由で表示します。
+            キャッシュと低速リクエストで無料枠向けに軽く動きます。
+          </p>
+        </div>
+      </aside>
+    </div>
+
+    <nav class="fixed inset-x-0 bottom-0 z-40 border-t border-xborder bg-black/90 backdrop-blur md:hidden">
+      <div class="mx-auto flex max-w-xl items-center justify-around py-2">
+        <a class="mobile-nav-link" href="/">⌂<span>Home</span></a>
+        <a class="mobile-nav-link" href="/search">⌕<span>Search</span></a>
+        <a class="mobile-nav-link" href="/?mode=for_you">✦<span>For you</span></a>
+      </div>
+    </nav>
+
+    <script src="{{ url_for('static', path='js/app.js') }}"></script>
+  </body>
+</html>
